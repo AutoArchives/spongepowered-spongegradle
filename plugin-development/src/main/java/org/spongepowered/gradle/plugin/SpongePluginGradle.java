@@ -26,6 +26,7 @@ package org.spongepowered.gradle.plugin;
 
 import net.kyori.mammoth.ProjectOrSettingsPlugin;
 import org.gradle.api.Action;
+import org.gradle.api.GradleException;
 import org.gradle.api.NamedDomainObjectProvider;
 import org.gradle.api.Project;
 import org.gradle.api.Task;
@@ -33,10 +34,13 @@ import org.gradle.api.artifacts.Configuration;
 import org.gradle.api.artifacts.Dependency;
 import org.gradle.api.artifacts.component.ComponentIdentifier;
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier;
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier;
+import org.gradle.api.artifacts.dsl.DependencyHandler;
 import org.gradle.api.artifacts.dsl.RepositoryHandler;
 import org.gradle.api.artifacts.result.ResolvedArtifactResult;
 import org.gradle.api.file.Directory;
 import org.gradle.api.file.FileCollection;
+import org.gradle.api.file.FileSystemLocation;
 import org.gradle.api.initialization.Settings;
 import org.gradle.api.plugins.ExtensionContainer;
 import org.gradle.api.plugins.JavaLibraryPlugin;
@@ -44,24 +48,36 @@ import org.gradle.api.plugins.JavaPlugin;
 import org.gradle.api.plugins.PluginContainer;
 import org.gradle.api.provider.Property;
 import org.gradle.api.provider.Provider;
+import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.JavaExec;
 import org.gradle.api.tasks.SourceSet;
 import org.gradle.api.tasks.SourceSetContainer;
 import org.gradle.api.tasks.TaskContainer;
 import org.gradle.api.tasks.TaskProvider;
 import org.gradle.api.tasks.bundling.AbstractArchiveTask;
+import org.gradle.api.tasks.testing.Test;
 import org.gradle.process.CommandLineArgumentProvider;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.UnknownNullability;
 import org.spongepowered.gradle.common.Constants;
 import org.spongepowered.gradle.common.SpongePlatform;
+import org.spongepowered.gradle.plugin.config.GameTestConfiguration;
 import org.spongepowered.gradle.plugin.config.PluginConfiguration;
 import org.spongepowered.gradle.plugin.task.WritePluginMetadataTask;
 
+import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public final class SpongePluginGradle implements ProjectOrSettingsPlugin {
 
@@ -96,6 +112,7 @@ public final class SpongePluginGradle implements ProjectOrSettingsPlugin {
         this.addApiDependency(sponge);
         final NamedDomainObjectProvider<Configuration> spongeRuntime = this.addRuntimeDependency(sponge);
         final TaskProvider<JavaExec> runServer = this.createRunTask(spongeRuntime, sponge);
+        this.configureGameTests(spongeRuntime, sponge);
 
         project.afterEvaluate(a -> {
             if (sponge.minecraftVersion().isPresent() && sponge.apiVersion().isPresent()) {
@@ -318,6 +335,118 @@ public final class SpongePluginGradle implements ProjectOrSettingsPlugin {
         return runServer;
     }
 
+    /**
+     * Gametests through the {@code test} task, when {@code sponge.gameTests} is configured: the platform's gametest module
+     * on the test classpath, at the version of the Sponge runtime unless one is given; the Sponge runtime on the test
+     * runtime classpath, whose JUnit launcher interceptor boots the game before discovery; and, through Sponge's
+     * {@code SPONGE_PLUGINS} environment locator, the plugin's own files as one plugin resource followed by the rest of
+     * the test runtime classpath as game-layer libraries.
+     */
+    private void configureGameTests(final NamedDomainObjectProvider<Configuration> spongeRuntime, final SpongePluginExtension sponge) {
+        final GameTestConfiguration gameTests = sponge.getGameTests();
+        final Provider<String> version = gameTests.getVersion().orElse(this.project.provider(() -> {
+            for (final ResolvedArtifactResult artifact : spongeRuntime.get().getIncoming().artifactView(view -> view.setLenient(true)).getArtifacts()) {
+                final ComponentIdentifier id = artifact.getVariant().getOwner();
+                if (id instanceof ModuleComponentIdentifier
+                    && ((ModuleComponentIdentifier) id).getModule().equals(sponge.platform().get().artifactId())) {
+                    return ((ModuleComponentIdentifier) id).getVersion();
+                }
+            }
+            throw new GradleException("No Sponge runtime to take the gametest module version from; set sponge.gameTests.version");
+        }));
+        final Provider<String> module = version.map(v -> Constants.Dependencies.SPONGE_GROUP + ":" + sponge.platform().get().artifactId() + "-gametest:" + v);
+        this.project.getPlugins().withType(JavaPlugin.class, v -> this.project.afterEvaluate(p -> {
+            if (!gameTests.getEnabled().get()) {
+                return;
+            }
+            final SourceSetContainer sourceSets = p.getExtensions().getByType(SourceSetContainer.class);
+            final SourceSet test = sourceSets.getByName(SourceSet.TEST_SOURCE_SET_NAME);
+            final SourceSet main = sourceSets.getByName(SourceSet.MAIN_SOURCE_SET_NAME);
+            if (gameTests.getPluginFiles().isEmpty()) { // the default; ConfigurableFileCollection.convention needs Gradle 8.8
+                // This project's outputs, and the projects it depends on: a multi-module plugin's other parts
+                final Configuration runtime = p.getConfigurations().getByName(test.getRuntimeClasspathConfigurationName());
+                gameTests.getPluginFiles().from(main.getOutput(), test.getOutput(),
+                    runtime.getIncoming().artifactView(view -> view.componentFilter(id -> id instanceof ProjectComponentIdentifier)).getFiles());
+            }
+            gameTests.getWorkingDirectory().convention(p.getLayout().getBuildDirectory().dir("gametest-run"));
+
+            final DependencyHandler dependencies = p.getDependencies();
+            // The test declaration and engine to compile against, and, being a plugin itself, found on the classpath at runtime
+            dependencies.addProvider(test.getCompileOnlyConfigurationName(), module);
+            dependencies.addProvider(test.getRuntimeOnlyConfigurationName(), module);
+            dependencies.add(test.getRuntimeOnlyConfigurationName(), p.files(spongeRuntime));
+            // A plugin built against Sponge's dev jar must not load it as a second copy of Sponge; the runtime provides it
+            final Map<String, String> spongeDevJar = new HashMap<>();
+            spongeDevJar.put("group", Constants.Dependencies.SPONGE_GROUP);
+            spongeDevJar.put("module", "sponge");
+            p.getConfigurations().named(test.getRuntimeClasspathConfigurationName(), c -> c.exclude(spongeDevJar));
+
+            p.getTasks().named(JavaPlugin.TEST_TASK_NAME, Test.class, task -> {
+                task.useJUnitPlatform();
+                task.getInputs().files(gameTests.getPluginFiles());
+                task.getJvmArgumentProviders().add(new GameTestArguments(gameTests.getLaunchTarget()));
+                // The plugin: Sponge unions these paths with the last one winning, manifest included, so any jar goes before
+                // the plugin's own directories, whose META-INF/MANIFEST.MF carries its mixin and access widener attributes.
+                final Provider<String> plugin = gameTests.getPluginFiles().getElements()
+                    .map(files -> files.stream()
+                        .map(FileSystemLocation::getAsFile)
+                        .sorted(Comparator.comparing(File::isDirectory))
+                        .map(File::getAbsolutePath)
+                        .collect(Collectors.joining("&")));
+                // Its libraries: whatever was added, then the rest of the test runtime classpath, each its own game-layer
+                // module as on a dev run's classpath; Sponge drops a copy of anything the game already loads. Minecraft
+                // itself (VanillaGradle's jar is another module over the same packages) and JUnit (the launcher must keep
+                // its own) stay out.
+                final Provider<Set<String>> excludes = gameTests.getExcludes();
+                gameTests.getLibraries().from(p.getConfigurations().getByName(test.getRuntimeClasspathConfigurationName())
+                    .getIncoming().artifactView(view -> view.componentFilter(id -> SpongePluginGradle.isLibrary(id) && !SpongePluginGradle.isExcluded(id, excludes.get()))).getFiles());
+                task.getInputs().files(gameTests.getLibraries());
+                final Provider<Set<FileSystemLocation>> libraries = gameTests.getLibraries().getElements();
+                final Provider<String> plugins = plugin.zip(libraries, (own, libs) -> Stream.concat(
+                    Stream.of(own),
+                    libs.stream().map(l -> l.getAsFile().getAbsolutePath())
+                ).collect(Collectors.joining(";")));
+                task.doFirst(new Action<Task>() {
+                    @Override
+                    public void execute(final Task t) {
+                        final Test run = (Test) t;
+                        run.environment("SPONGE_PLUGINS", plugins.get());
+                        final Path directory = gameTests.getWorkingDirectory().get().getAsFile().toPath();
+                        run.setWorkingDir(directory.toFile());
+                        try {
+                            Files.createDirectories(directory);
+                            Files.write(directory.resolve("eula.txt"), Collections.singletonList("eula=true"));
+                        } catch (final IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    }
+                });
+            });
+        }));
+    }
+
+    private static boolean isExcluded(final ComponentIdentifier id, final Set<String> excludes) {
+        if (!(id instanceof ModuleComponentIdentifier)) {
+            return false;
+        }
+        final ModuleComponentIdentifier module = (ModuleComponentIdentifier) id;
+        return excludes.contains(module.getGroup()) || excludes.contains(module.getGroup() + ":" + module.getModule());
+    }
+
+    private static boolean isLibrary(final ComponentIdentifier id) {
+        if (!(id instanceof ModuleComponentIdentifier)) {
+            return false; // a project is a part of the plugin (see the plugin files default), a file the Sponge runtime jar
+        }
+        final ModuleComponentIdentifier module = (ModuleComponentIdentifier) id;
+        final String group = module.getGroup();
+        return !group.equals("net.minecraft")
+            && !group.startsWith("org.junit")
+            && !group.equals("org.opentest4j")
+            && !group.equals("org.apiguardian")
+            && !(group.equals(Constants.Dependencies.SPONGE_GROUP)
+                && (module.getModule().equals(Constants.Dependencies.SPONGE_API) || module.getModule().endsWith("-gametest")));
+    }
+
     private void configurePluginMetaGeneration(final SpongePluginExtension sponge) {
         // Configure some useful default values
         sponge.getPlugins().configureEach(new ConfigurePluginAction(this.project, sponge));
@@ -331,6 +460,8 @@ public final class SpongePluginGradle implements ProjectOrSettingsPlugin {
                 public void execute(final WritePluginMetadataTask task) {
                     task.getSourceContainer().set(sponge);
                     task.getOutputDirectory().set(generatedResourcesDirectory);
+                    // A module of a plugin whose metadata another module writes declares no plugin of its own
+                    task.onlyIf(t -> !sponge.getPlugins().isEmpty());
                 }
             }
         );
@@ -343,6 +474,28 @@ public final class SpongePluginGradle implements ProjectOrSettingsPlugin {
                 }
             });
         });
+    }
+
+    /** The JVM arguments that make the test JVM boot the game: Sponge's launcher interceptor, and what it launches */
+    public static final class GameTestArguments implements CommandLineArgumentProvider {
+        private final Provider<String> launchTarget;
+
+        GameTestArguments(final Provider<String> launchTarget) {
+            this.launchTarget = launchTarget;
+        }
+
+        @Input
+        public Provider<String> getLaunchTarget() {
+            return this.launchTarget;
+        }
+
+        @Override
+        public Iterable<String> asArguments() {
+            return Arrays.asList(
+                "-Djunit.platform.launcher.interceptors.enabled=true",
+                "-Dsponge.test.args=--launchTarget " + this.launchTarget.get()
+            );
+        }
     }
 
     private static class ConfigurePluginAction implements Action<PluginConfiguration> {
